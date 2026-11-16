@@ -558,7 +558,10 @@ const GOOGLE_CONFIG = {
   CLIENT_ID: '717968005129-vk49u0r2ef04lm9gqf15a2korq7cft2k.apps.googleusercontent.com',  // 例: '1234567890-abcdefg.apps.googleusercontent.com'
   API_KEY:   'AIzaSyDy1djov_iGjq7oTvE8a9dPc3oSgZjNI8M',  // 例: 'AIzaSyA...'
   SCOPES:    'https://www.googleapis.com/auth/drive.file',
-  DISCOVERY_DOC: 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'
+  DISCOVERY_DOC: 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest',
+  // 公開行程檔：沒登入的人打開網頁也會讀這份（用 API_KEY 讀，不用登入）
+  // Drive 共用設定必須是「知道連結的任何人都能檢視」；留空就改讀 trip.json
+  PUBLIC_FILE_URL: 'https://drive.google.com/file/d/1CzcFJgADGZ79ESDnHQhOMf5IajQ-58DH/view?usp=drive_link'
 };
 // 從 CLIENT_ID 取出專案編號，給 Picker 的 setAppId 使用（drive.file scope 必填）
 const GOOGLE_APP_ID = (GOOGLE_CONFIG.CLIENT_ID.match(/^(\d+)-/) || [])[1] || '';
@@ -573,7 +576,8 @@ const driveState = {
   userEmail: null,
   saving: false,
   dirty:  false,
-  saveTimer: null
+  saveTimer: null,
+  loadedFromDrive: false  // 已用登入身分從 Drive 載入過，開頁時的公開檔就不要再蓋過去
 };
 
 const state = {
@@ -954,6 +958,7 @@ async function loadFromDriveById(fileId, name){
     driveState.fileId = fileId;
     driveState.fileName = fileName;
     driveState.dirty = false;
+    driveState.loadedFromDrive = true;
     saveDriveSettings();
     // 直接寫入畫面（避開 saveData 觸發自動儲存的循環）
     state.data = parsed;
@@ -4073,16 +4078,26 @@ async function loadInitial(){
     setStatus('已載入：本機儲存版本');
     return;
   }
-  await loadDefaultJson();
+  await loadDefaultJson({ initial: true });
+}
+
+// 公開行程檔的讀取網址：用 API_KEY 直接讀，不需要登入
+function publicDriveFileUrl(){
+  const id = parseDriveFileId(GOOGLE_CONFIG.PUBLIC_FILE_URL);
+  if(!id || !GOOGLE_CONFIG.API_KEY) return '';
+  return 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(id)
+       + '?alt=media&key=' + encodeURIComponent(GOOGLE_CONFIG.API_KEY);
 }
 
 // 預設 trip.json 來源：寫死指向 GitHub jp2026 分支的 raw 檔
 // 這樣不管在哪個網域、本機 file:// 或其他 origin 打開，都能讀到最新內容
 const DEFAULT_TRIP_URL = 'https://raw.githubusercontent.com/eithwa/travel-notes/jp2026/trip.json';
 
-async function loadDefaultJson(){
-  // 依序嘗試：同 origin 的相對路徑（部署在 jp2026 時最快） → GitHub raw（保底，全球可用）
+async function loadDefaultJson(opts = {}){
+  // 依序嘗試：Google Drive 公開行程檔 → 同 origin 的 trip.json → GitHub raw（保底，全球可用）
+  const driveUrl = publicDriveFileUrl();
   const candidates = [];
+  if(driveUrl) candidates.push(driveUrl);
   try{ candidates.push(new URL('trip.json', document.baseURI).href); }catch(e){}
   if(!candidates.includes(DEFAULT_TRIP_URL)) candidates.push(DEFAULT_TRIP_URL);
 
@@ -4091,11 +4106,21 @@ async function loadDefaultJson(){
       const res = await fetch(url, {cache:'no-store'});
       if(!res.ok) throw new Error('HTTP ' + res.status);
       const parsed = await res.json();
+      // 開頁時，登入者自己的 Drive 檔如果已經先載入，就不要用預設內容蓋過去
+      if(opts.initial && driveState.loadedFromDrive) return;
       setData(parsed);
-      setStatus(url === DEFAULT_TRIP_URL ? '目前使用 GitHub jp2026 的 trip.json' : '目前使用預設 trip.json');
+      // 開頁載入的是預設內容、不是使用者的編輯：取消 setData 排程的自動存檔，免得寫回登入者的 Drive 檔
+      if(opts.initial){
+        clearTimeout(driveState.saveTimer);
+        driveState.dirty = false;
+        updateDriveUI();
+      }
+      setStatus(url === driveUrl ? '目前使用 Google Drive 公開行程檔'
+              : url === DEFAULT_TRIP_URL ? '目前使用 GitHub jp2026 的 trip.json'
+              : '目前使用預設 trip.json');
       return;
     }catch(err){
-      console.warn('載入 ' + url + ' 失敗：', err);
+      console.warn('載入 ' + (url === driveUrl ? 'Google Drive 公開行程檔' : url) + ' 失敗：', err);
     }
   }
   setStatus('預設 trip.json 載入失敗（請檢查網路連線）');
